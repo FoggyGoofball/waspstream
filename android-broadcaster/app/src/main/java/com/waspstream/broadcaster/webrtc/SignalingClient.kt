@@ -1,8 +1,10 @@
 package com.waspstream.broadcaster.webrtc
 
+import android.util.Log
 import com.google.firebase.database.ChildEventListener
 import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
+import com.waspstream.broadcaster.firebase.DiagnosticsLogger
 import com.waspstream.broadcaster.firebase.FirebaseRepository
 import kotlinx.coroutines.tasks.await
 
@@ -23,7 +25,10 @@ class SignalingClient {
      * Write the local SDP offer to RTDB signaling path.
      */
     suspend fun sendOffer(offer: Map<String, String>) {
+        DiagnosticsLogger.log("SIGNAL_OFFER", "Writing SDP offer to RTDB",
+            mapOf("type" to (offer["type"] ?: ""), "sdp_length" to (offer["sdp"]?.length ?: 0)))
         FirebaseRepository.writeOffer(offer)
+        DiagnosticsLogger.log("SIGNAL_OFFER_DONE", "SDP offer written to /signaling/offer")
     }
 
     /**
@@ -42,6 +47,7 @@ class SignalingClient {
             override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
                 @Suppress("UNCHECKED_CAST")
                 val answer = snapshot.value as? Map<String, String>
+                Log.d("SignalingClient", "Answer child added: type=${answer?.get("type")}, hasSdp=${answer?.containsKey("sdp")}")
                 onAnswer(answer)
             }
             override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) {}
@@ -63,6 +69,7 @@ class SignalingClient {
             override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
                 @Suppress("UNCHECKED_CAST")
                 val candidate = snapshot.value as? Map<String, Any?>
+                Log.d("SignalingClient", "Viewer ICE candidate received: $candidate")
                 onCandidate(candidate)
             }
             override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) {}
@@ -77,19 +84,25 @@ class SignalingClient {
     }
 
     /**
-     * Wait for the viewer's answer using a blocking get (coroutine-friendly).
+     * Wait for the viewer's answer using a polling loop (coroutine-friendly).
      */
     suspend fun waitForAnswer(timeoutMs: Long = 30_000L): Map<String, String>? {
+        DiagnosticsLogger.log("SIGNAL_WAIT_ANSWER", "Polling for viewer answer (timeout=${timeoutMs}ms)")
         val startTime = System.currentTimeMillis()
+        var pollCount = 0
         while (System.currentTimeMillis() - startTime < timeoutMs) {
+            pollCount++
             val snapshot = FirebaseRepository.signalingRef.child("answer").get().await()
             @Suppress("UNCHECKED_CAST")
             val answer = snapshot.value as? Map<String, String>
             if (answer != null && answer["type"] == "answer") {
+                DiagnosticsLogger.log("SIGNAL_ANSWER_OK", "Viewer answer received after ${System.currentTimeMillis() - startTime}ms ($pollCount polls)",
+                    mapOf("type" to (answer["type"] ?: ""), "sdp_length" to (answer["sdp"]?.length ?: 0)))
                 return answer
             }
             kotlinx.coroutines.delay(500)
         }
+        DiagnosticsLogger.logError("SIGNAL_ANSWER_TIMEOUT", "Timed out after $timeoutMs ms ($pollCount polls), no answer from viewer")
         return null
     }
 
@@ -97,6 +110,7 @@ class SignalingClient {
      * Clean up all signaling listeners.
      */
     fun cleanup() {
+        Log.d("SignalingClient", "cleanup() — removing RTDB listeners")
         answerListener?.let {
             FirebaseRepository.signalingRef.child("answer").removeEventListener(it)
         }

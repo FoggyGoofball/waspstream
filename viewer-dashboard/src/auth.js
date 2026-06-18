@@ -21,6 +21,7 @@ const logoutBtn = document.getElementById('logout-btn');
 const userEmailSpan = document.getElementById('user-email');
 
 let currentUser = null;
+let authReadyDispatched = false;
 
 /**
  * Initialize authentication system.
@@ -35,6 +36,7 @@ export function initAuth() {
     if (user) {
       showDashboard(user);
     } else {
+      authReadyDispatched = false;
       showLogin();
     }
   });
@@ -98,8 +100,12 @@ function showDashboard(user) {
   dashboardContainer.classList.remove('hidden');
   userEmailSpan.textContent = user.email;
 
-  // Dispatch event so other modules know we're authenticated
-  window.dispatchEvent(new CustomEvent('auth-ready', { detail: { user } }));
+  // Dispatch event so other modules know we're authenticated.
+  // Guard against onAuthStateChanged firing multiple times (cached token + refresh).
+  if (!authReadyDispatched) {
+    authReadyDispatched = true;
+    window.dispatchEvent(new CustomEvent('auth-ready', { detail: { user } }));
+  }
 }
 
 /**

@@ -11,6 +11,10 @@
     "signaling": {
       ".read": "auth != null",
       ".write": "auth != null"
+    },
+    "diagnostics": {
+      ".read": "auth != null",
+      ".write": "auth != null"
     }
   }
 }

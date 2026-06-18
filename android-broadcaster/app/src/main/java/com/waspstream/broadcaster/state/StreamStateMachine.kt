@@ -25,13 +25,16 @@ class StreamStateMachine(
     private val onCaptureSnapshot: () -> Unit
 ) {
 
+    enum class State { IDLE, ACTIVE }
+
     companion object {
         private const val TAG = "StreamStateMachine"
         private const val SNAPSHOT_INTERVAL_MS = 300_000L // 5 minutes
         private const val COOLDOWN_MS = 60_000L          // 60 seconds
+        /** Minimum time the machine must stay in ACTIVE before it can return to IDLE.
+         *  Prevents rapid IDLE↔ACTIVE flickering that breaks WebRTC initialization. */
+        private const val MIN_HOLD_MS = 10_000L          // 10 seconds
     }
-
-    enum class State { IDLE, ACTIVE }
 
     @Volatile
     var currentState: State = State.IDLE
@@ -46,11 +49,16 @@ class StreamStateMachine(
     // Timer for motion cooldown during ACTIVE
     private var cooldownTimer: Runnable? = null
 
+    // Timestamp when we entered ACTIVE state (for minimum hold enforcement)
+    private var activeSinceMs = 0L
+
     // Track motion state
     private var motionDetected = false
 
     /**
      * Called by the MotionDetector when motion state changes.
+     * The MotionDetector has a 2-second debounce, and this state machine
+     * additionally enforces a MIN_HOLD_MS in ACTIVE state.
      */
     fun onMotionChange(motion: Boolean) {
         motionDetected = motion
@@ -67,8 +75,8 @@ class StreamStateMachine(
                     // Motion detected while active — reset cooldown timer
                     resetCooldownTimer()
                 } else {
-                    // No motion — start cooldown if not already running
-                    if (cooldownTimer == null) {
+                    // No motion — only start cooldown if minimum hold time has elapsed
+                    if (cooldownTimer == null && hasMinHoldElapsed()) {
                         startCooldownTimer()
                     }
                 }
@@ -77,10 +85,24 @@ class StreamStateMachine(
     }
 
     /**
+     * Returns true if the minimum hold time in ACTIVE state has elapsed.
+     * Prevents transitioning back to IDLE within MIN_HOLD_MS of entering ACTIVE.
+     */
+    private fun hasMinHoldElapsed(): Boolean {
+        val elapsed = System.currentTimeMillis() - activeSinceMs
+        if (elapsed < MIN_HOLD_MS) {
+            Log.d(TAG, "Minimum hold not elapsed yet ($elapsed ms < $MIN_HOLD_MS ms)")
+            return false
+        }
+        return true
+    }
+
+    /**
      * Transition from IDLE to ACTIVE.
      */
     private fun transitionToActive() {
         currentState = State.ACTIVE
+        activeSinceMs = System.currentTimeMillis()
         stopSnapshotTimer()
 
         scope.launch {

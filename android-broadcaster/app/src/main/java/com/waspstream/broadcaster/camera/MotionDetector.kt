@@ -13,6 +13,7 @@ import java.nio.ByteBuffer
  * Converts each camera frame to grayscale luminance, compares the average luminance
  * between consecutive frames, and signals motion if the delta exceeds a threshold.
  *
+ * Includes a 2-second debounce to prevent rapid toggling between IDLE/ACTIVE states.
  * This avoids heavy libraries like OpenCV and relies purely on CameraX's ImageAnalysis.
  */
 class MotionDetector(
@@ -20,15 +21,23 @@ class MotionDetector(
 ) : ImageAnalysis.Analyzer {
 
     companion object {
-        private const val MOTION_THRESHOLD = 30   // Luminance delta threshold
-        private const val FRAME_SKIP = 3           // Process every Nth frame to reduce CPU
-        private const val LUMINANCE_SAMPLE_SIZE = 64 // Pixels per row/col to sample
+        // Threshold raised to 60 to avoid triggering on minor lighting changes
+        // (headlights, passing clouds, camera auto-exposure adjustments)
+        private const val MOTION_THRESHOLD = 60
+        // Process every 6th frame to reduce CPU load and avoid flicker
+        private const val FRAME_SKIP = 6
+        // Finer grid (32x32 sample) gives better spatial localization of motion
+        private const val LUMINANCE_SAMPLE_SIZE = 32
+        // 2-second debounce: once motion fires, no new events for 2 seconds
+        private const val DEBOUNCE_MS = 2000L
     }
 
     @Volatile
     private var previousLuminance: Float = -1f
     private var frameCount = 0
     private var isInMotion = false
+    private var lastMotionTimeMs = 0L
+    private var lastEventTimeMs = 0L
 
     @ExperimentalGetImage
     override fun analyze(imageProxy: ImageProxy) {
@@ -53,13 +62,21 @@ class MotionDetector(
             }
 
             val currentLuminance = computeAverageLuminance(image)
+            val nowMs = System.currentTimeMillis()
 
             if (previousLuminance >= 0) {
                 val delta = kotlin.math.abs(currentLuminance - previousLuminance)
                 val motion = delta > MOTION_THRESHOLD
 
-                if (motion != isInMotion) {
+                // Debounce: suppress events within DEBOUNCE_MS of the last event
+                val withinDebounce = (nowMs - lastEventTimeMs) < DEBOUNCE_MS
+
+                if (motion != isInMotion && !withinDebounce) {
                     isInMotion = motion
+                    lastEventTimeMs = nowMs
+                    if (motion) {
+                        lastMotionTimeMs = nowMs
+                    }
                     onMotionDetected(motion)
                 }
             }

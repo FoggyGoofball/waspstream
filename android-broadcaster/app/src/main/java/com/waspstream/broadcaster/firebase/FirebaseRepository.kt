@@ -16,6 +16,7 @@ object FirebaseRepository {
     private val auth: FirebaseAuth = FirebaseAuth.getInstance()
 
     // RTDB Reference paths
+    val databaseRef: DatabaseReference = database.reference  // root ref for diagnostics
     val stateRef: DatabaseReference = database.getReference("state")
     val telemetryRef: DatabaseReference = database.getReference("telemetry")
     val signalingRef: DatabaseReference = database.getReference("signaling")

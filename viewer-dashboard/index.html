@@ -124,6 +124,22 @@
           <div class="telemetry-label">Last Updated</div>
           <div class="telemetry-value-small" id="last-updated">--</div>
         </div>
+
+        <!-- Diagnostics Log Panel (hidden by default, toggle with D key) -->
+        <button id="diag-toggle" class="btn btn-sm btn-secondary" style="margin-top: 12px; width: 100%;">
+          🛠 Diagnostics (D)
+        </button>
+        <div id="diagnostics-panel" class="diagnostics-panel hidden">
+          <h3 class="panel-title" style="font-size: 13px; margin-top: 8px;">Handshake Log</h3>
+          <div id="diag-android" class="diag-section">
+            <div class="diag-source-label">Android Broadcaster</div>
+            <pre id="diag-android-log" class="diag-log">(waiting for data...)</pre>
+          </div>
+          <div id="diag-viewer" class="diag-section">
+            <div class="diag-source-label">Viewer Dashboard</div>
+            <pre id="diag-viewer-log" class="diag-log">(waiting for data...)</pre>
+          </div>
+        </div>
       </aside>
     </main>
   </div>

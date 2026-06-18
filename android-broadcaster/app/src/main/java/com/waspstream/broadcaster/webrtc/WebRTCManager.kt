@@ -1,15 +1,22 @@
 package com.waspstream.broadcaster.webrtc
 
 import android.content.Context
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import org.webrtc.*
 import java.util.*
+import com.waspstream.broadcaster.firebase.DiagnosticsLogger
 
 /**
  * Manages the WebRTC PeerConnection lifecycle on the Broadcaster side.
  *
  * The Broadcaster creates a PeerConnection, adds a VideoTrack from the camera,
  * creates an SDP Offer, and handles the signaling exchange with the Viewer.
+ *
+ * CRITICAL: EGL must be initialized from the main thread on Mediatek/Android 8.1.
+ * Using a dedicated HandlerThread for SurfaceTextureHelper to avoid EGL thread
+ * affinity issues that cause SIGABRT in WebRTC's native signaling_thread.
  */
 class WebRTCManager(
     private val context: Context,
@@ -29,14 +36,29 @@ class WebRTCManager(
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var audioTrack: AudioTrack? = null
+    private var videoCapturer: CameraVideoCapturer? = null
 
-    private val eglBase = EglBase.create()
+    // Dedicated thread for SurfaceTextureHelper to keep EGL isolated from coroutine threads
+    private var webRtcThread: HandlerThread? = null
+    private var webRtcHandler: Handler? = null
+    private var eglBase: EglBase? = null
+
+    /** Expose EGL context for local preview SurfaceViewRenderer */
+    val eglContext: EglBase.Context?
+        get() = eglBase?.eglBaseContext
 
     /**
      * Initialize the PeerConnectionFactory.
      * Must be called once before any peer connection is created.
      */
     fun initialize() {
+        Log.d(TAG, "initialize() — creating HandlerThread for EGL")
+        webRtcThread = HandlerThread("WebRTC-EglThread").apply { start() }
+        webRtcHandler = Handler(webRtcThread!!.looper)
+
+        // Create EGL base on the main thread (required for Mediatek)
+        eglBase = EglBase.create()
+
         // Initialize WebRTC
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context)
@@ -48,6 +70,8 @@ class WebRTCManager(
         peerConnectionFactory = PeerConnectionFactory.builder()
             .setOptions(options)
             .createPeerConnectionFactory()
+
+        Log.d(TAG, "initialize() complete — PeerConnectionFactory created")
     }
 
     /**
@@ -56,20 +80,31 @@ class WebRTCManager(
      */
     fun createPeerConnection(videoCapturer: CameraVideoCapturer, localPreview: SurfaceViewRenderer?) {
         val factory = peerConnectionFactory ?: throw IllegalStateException("PeerConnectionFactory not initialized")
+        val egl = eglBase ?: throw IllegalStateException("EglBase not initialized")
+
+        Log.d(TAG, "createPeerConnection() — using dedicated HandlerThread for SurfaceTextureHelper")
+        DiagnosticsLogger.log("WEBRTC_PC", "Creating PeerConnection on dedicated EGL thread")
 
         // Create video source and track
         videoSource = factory.createVideoSource(videoCapturer.isScreencast)
+
+        // CRITICAL: Must make EGL context current on THIS thread before sharing with
+        // SurfaceTextureHelper. On Mediatek/Android 8.1, the EGL context cannot be shared
+        // across threads unless it has been made current at least once on the creating thread.
+        // Otherwise the first video frame triggers a SIGABRT in the native GPU pipeline.
+        egl.makeCurrent()
         videoCapturer.initialize(
-            SurfaceTextureHelper.create(Thread.currentThread().name, eglBase.eglBaseContext),
+            SurfaceTextureHelper.create("WebRTC-SurfaceTexture", egl.eglBaseContext),
             context,
             videoSource?.capturerObserver
         )
-        videoCapturer.startCapture(1280, 720, 30)
+        // Lower resolution and framerate to reduce encoder + EGL pipeline pressure
+        // on low-end Mediatek SoCs (MT6739/MT6580 based devices).
+        videoCapturer.startCapture(640, 480, 15)
 
         videoTrack = factory.createVideoTrack("broadcast_video", videoSource!!)
         videoTrack?.setEnabled(true)
 
-        // Set up local preview
         localPreview?.let { preview ->
             videoTrack?.addSink(preview)
         }
@@ -92,9 +127,13 @@ class WebRTCManager(
             iceCandidatePoolSize = 0
         }
 
+        DiagnosticsLogger.log("WEBRTC_PC_CFG", "PeerConnection.RTCConfiguration built, creating PC")
+
         peerConnection = factory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
             override fun onIceCandidate(candidate: IceCandidate) {
                 Log.d(TAG, "onIceCandidate: $candidate")
+                DiagnosticsLogger.log("WEBRTC_ICE", "onIceCandidate generated",
+                    mapOf("sdp" to candidate.sdp, "sdpMLineIndex" to candidate.sdpMLineIndex))
                 onIceCandidate(candidate)
             }
 
@@ -140,6 +179,7 @@ class WebRTCManager(
 
             override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
                 Log.d(TAG, "onConnectionChange: $state")
+                DiagnosticsLogger.log("WEBRTC_CONNECTION", "Connection state: $state")
                 onConnectionStateChanged(state)
             }
 
@@ -153,6 +193,8 @@ class WebRTCManager(
         videoTrack?.let { stream.addTrack(it) }
         audioTrack?.let { stream.addTrack(it) }
         peerConnection?.addStream(stream)
+
+        DiagnosticsLogger.log("WEBRTC_PC_OK", "PeerConnection created with video+audio tracks")
     }
 
     /**
@@ -214,6 +256,7 @@ class WebRTCManager(
      * Dispose the peer connection and release all resources.
      */
     fun dispose() {
+        Log.d(TAG, "dispose() — cleaning up WebRTC resources")
         try {
             videoCapturer?.stopCapture()
             videoCapturer?.dispose()
@@ -229,11 +272,15 @@ class WebRTCManager(
         videoSource = null
         videoTrack = null
         audioTrack = null
-        eglBase.release()
-    }
+        eglBase?.release()
+        eglBase = null
 
-    // Reference to video capturer for disposal
-    private var videoCapturer: CameraVideoCapturer? = null
+        webRtcThread?.quitSafely()
+        webRtcThread = null
+        webRtcHandler = null
+
+        Log.d(TAG, "dispose() complete")
+    }
 
     fun setVideoCapturer(capturer: CameraVideoCapturer) {
         this.videoCapturer = capturer

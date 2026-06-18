@@ -273,3 +273,64 @@
     font-size: 14px;
   }
 }
+
+/* ─── Diagnostics Panel ───────────────────────────────────────────────── */
+.diagnostics-panel {
+  margin-top: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  max-height: 300px;
+  overflow-y: auto;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+}
+
+.diagnostics-panel.hidden {
+  display: none;
+}
+
+.diag-section {
+  margin-bottom: 8px;
+}
+
+.diag-source-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.diag-log {
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 6px 8px;
+  color: #ccc;
+  font-size: 10px;
+  line-height: 1.4;
+  max-height: 100px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diag-log .error {
+  color: #ff5252;
+}
+
+.diag-log .ok {
+  color: #69f0ae;
+}
+
+.diag-log .warn {
+  color: #ffd740;
+}
+
+.btn-sm {
+  padding: 4px 8px;
+  font-size: 11px;
+}
