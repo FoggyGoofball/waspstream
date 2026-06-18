@@ -43,7 +43,7 @@ object FirebaseRepository {
             "last_updated" to System.currentTimeMillis()
         )
         if (imageData != null) {
-            updates["latest_image_data"] = imageData
+            updates["latest_image"] = imageData
         }
         stateRef.updateChildren(updates).await()
     }

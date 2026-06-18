@@ -73,10 +73,7 @@ class MainActivity : AppCompatActivity() {
         batteryText = findViewById(R.id.batteryText)
         motionIndicator = findViewById(R.id.motionIndicator)
 
-        // Start foreground service
-        startForegroundService()
-
-        // Request permissions
+        // Request permissions FIRST — foreground service requires granted permissions on Android 14+
         requestPermissions()
     }
 
@@ -113,6 +110,9 @@ class MainActivity : AppCompatActivity() {
      * Initialize all system components after permissions are granted.
      */
     private fun initializeSystem() {
+        // Start foreground service AFTER permissions are granted
+        startForegroundService()
+
         lifecycleScope.launch {
             // 1. Firebase anonymous auth
             val authSuccess = FirebaseRepository.signInAnonymously()
