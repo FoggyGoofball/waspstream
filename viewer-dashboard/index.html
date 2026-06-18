@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' https://*.firebaseio.com https://*.googleapis.com https://*.firebasestorage.app https://*.firebasestorage.googleapis.com wss://*.firebaseio.com; script-src 'self' 'unsafe-inline' https://*.firebaseio.com; img-src 'self' https://firebasestorage.googleapis.com https://*.googleapis.com data:; style-src 'self' 'unsafe-inline'; media-src 'self' blob:;" />
+  <meta name="description" content="Vespiculture SCADA Dashboard - Wasp colony monitoring system" />
+  <title>WaspStream SCADA</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
+  <link rel="stylesheet" href="/src/styles/main.css" />
+  <link rel="stylesheet" href="/src/styles/dashboard.css" />
+  <script type="module" src="/src/main.js"></script>
+</head>
+<body>
+  <!-- Authentication View -->
+  <div id="auth-container" class="auth-container hidden">
+    <div class="auth-card">
+      <div class="auth-logo">
+        <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+          <circle cx="24" cy="24" r="22" stroke="#FFA000" stroke-width="3"/>
+          <path d="M24 10C24 10 16 16 16 24C16 28.4 19.6 34 24 34C28.4 34 32 28.4 32 24C32 16 24 10 24 10Z" fill="#FFA000" opacity="0.6"/>
+          <circle cx="24" cy="24" r="4" fill="#FFA000"/>
+        </svg>
+      </div>
+      <h1 class="auth-title">WaspStream SCADA</h1>
+      <p class="auth-subtitle">Vespiculture Monitoring System</p>
+      <form id="login-form" class="auth-form">
+        <div class="form-group">
+          <label for="email">Email</label>
+          <input type="email" id="email" placeholder="admin@example.com" required autocomplete="email" />
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" placeholder="••••••••" required autocomplete="current-password" />
+        </div>
+        <p id="auth-error" class="auth-error hidden">Invalid credentials</p>
+        <button type="submit" class="btn btn-primary" id="login-btn">Sign In</button>
+      </form>
+      <p class="auth-footer">Authorized personnel only</p>
+    </div>
+  </div>
+
+  <!-- Dashboard View -->
+  <div id="dashboard-container" class="dashboard-container hidden">
+    <header class="dashboard-header">
+      <div class="header-left">
+        <svg width="32" height="32" viewBox="0 0 48 48" fill="none">
+          <circle cx="24" cy="24" r="22" stroke="#FFA000" stroke-width="3"/>
+          <path d="M24 10C24 10 16 16 16 24C16 28.4 19.6 34 24 34C28.4 34 32 28.4 32 24C32 16 24 10 24 10Z" fill="#FFA000" opacity="0.6"/>
+          <circle cx="24" cy="24" r="4" fill="#FFA000"/>
+        </svg>
+        <h1>WaspStream SCADA</h1>
+      </div>
+      <div class="header-right">
+        <span id="user-email" class="user-email"></span>
+        <button id="logout-btn" class="btn btn-secondary">Sign Out</button>
+      </div>
+    </header>
+
+    <main class="dashboard-main">
+      <!-- Video / Image Panel -->
+      <section class="viewer-panel">
+        <div class="viewer-container" id="viewer-container">
+          <!-- Stream status badge -->
+          <div id="status-badge" class="status-badge status-offline">
+            <span class="status-dot"></span>
+            <span id="status-text">Loading...</span>
+          </div>
+
+          <!-- Static image (shown when offline) -->
+          <img id="static-image" class="static-image" src="" alt="Colony Snapshot" />
+
+          <!-- Video element (shown when live) -->
+          <video id="live-video" class="live-video hidden" autoplay playsinline muted></video>
+
+          <!-- Overlay for offline state -->
+          <div id="offline-overlay" class="offline-overlay">
+            <div class="overlay-content">
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="#FFA000">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+              </svg>
+              <p>Colony Dormant</p>
+              <span>Static Monitoring Active</span>
+            </div>
+          </div>
+
+          <!-- Connection status -->
+          <div id="connection-status" class="connection-status hidden">
+            <div class="spinner"></div>
+            <span>Connecting to broadcaster...</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Telemetry Panel -->
+      <aside class="telemetry-panel">
+        <h2 class="panel-title">Telemetry</h2>
+
+        <div class="telemetry-card">
+          <div class="telemetry-label">Battery</div>
+          <div class="telemetry-value" id="battery-value">--%</div>
+          <div class="telemetry-bar">
+            <div class="telemetry-bar-fill" id="battery-bar" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div class="telemetry-card">
+          <div class="telemetry-label">Temperature</div>
+          <div class="telemetry-value" id="temperature-value">--°C</div>
+          <div class="telemetry-bar">
+            <div class="telemetry-bar-fill temp-bar" id="temperature-bar" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div class="telemetry-card">
+          <div class="telemetry-label">Stream Status</div>
+          <div class="stream-status-indicator" id="stream-status">
+            <span class="status-dot status-dot-large"></span>
+            <span>Offline</span>
+          </div>
+        </div>
+
+        <div class="telemetry-card">
+          <div class="telemetry-label">Last Updated</div>
+          <div class="telemetry-value-small" id="last-updated">--</div>
+        </div>
+      </aside>
+    </main>
+  </div>
+</body>
+</html>

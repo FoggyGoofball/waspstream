@@ -1,0 +1,19 @@
+{
+  "name": "waspstream-viewer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Vespiculture SCADA Viewer Dashboard - WebRTC surveillance and telemetry monitor for wasp colony operations",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "vite build && npx gh-pages -d dist"
+  },
+  "dependencies": {
+    "firebase": "^10.7.1"
+  },
+  "devDependencies": {
+    "vite": "^5.0.12"
+  }
+}

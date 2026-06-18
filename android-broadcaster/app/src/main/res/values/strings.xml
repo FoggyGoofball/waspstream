@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WaspStream Broadcaster</string>
+    <string name="channel_name">WaspStream Broadcast</string>
+    <string name="channel_description">Ongoing broadcast notification for wasp colony monitoring</string>
+    <string name="notification_text">Colony monitoring active</string>
+    <string name="temperature_alert">High temperature detected: %d°C</string>
+    <string name="status_idle">Colony Dormant</string>
+    <string name="status_active">Motion Detected - Active</string>
+    <string name="camera_permission_rationale">Camera permission is required to monitor the wasp colony.</string>
+</resources>

@@ -1,0 +1,29 @@
+# Environment variables (contains Firebase credentials)
+.env
+.env.local
+.env.production
+
+# Android
+local.properties
+android-broadcaster/local.properties
+android-broadcaster/.gradle/
+android-broadcaster/build/
+android-broadcaster/app/build/
+android-broadcaster/captures/
+android-broadcaster/.externalNativeBuild/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+viewer-dashboard/node_modules/
+
+# Build output
+viewer-dashboard/dist/

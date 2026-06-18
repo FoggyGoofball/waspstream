@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.WaspStream" parent="Theme.AppCompat.Light.DarkActionBar">
+        <item name="colorPrimary">#FF1B5E20</item>
+        <item name="colorPrimaryDark">#FF0D3B0F</item>
+        <item name="colorAccent">#FFFFA000</item>
+        <item name="android:windowBackground">#FF000000</item>
+        <item name="android:statusBarColor">#FF0D3B0F</item>
+    </style>
+</resources>

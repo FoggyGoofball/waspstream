@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "920630624107",
+    "project_id": "waspstream-37bad",
+    "storage_bucket": "waspstream-37bad.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:920630624107:android:78adf73c7a680479f7962e",
+        "android_client_info": {
+          "package_name": "com.waspstream.broadcaster"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCby9t6mXFl_LxQDXmnsRjPo6TQS8D2iAI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

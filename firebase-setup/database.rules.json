@@ -1,0 +1,16 @@
+{
+  "rules": {
+    "state": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "telemetry": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "signaling": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    }
+  }
+}
