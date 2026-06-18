@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   root: '.',
-  base: '/',
+  base: '/waspstream/',
   build: {
     outDir: 'dist',
     sourcemap: false,
