@@ -122,7 +122,7 @@ function updateTelemetryUI(data) {
  * Update the UI based on stream state changes.
  */
 function updateStateUI(data) {
-  const { stream_status, latest_image_data, last_updated } = data;
+  const { stream_status, latest_image, last_updated } = data;
 
   // Update status badge
   if (stream_status === 'live') {
@@ -146,9 +146,9 @@ function updateStateUI(data) {
       <span>Offline</span>
     `;
 
-    // Show static image from base64 data if available, hide video
-    if (latest_image_data) {
-      staticImage.src = latest_image_data;
+    // Show static image from URL if available, hide video
+    if (latest_image) {
+      staticImage.src = latest_image;
       staticImage.classList.remove('hidden');
     }
     liveVideo.classList.add('hidden');
