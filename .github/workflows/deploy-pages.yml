@@ -2,7 +2,7 @@ name: Deploy Viewer Dashboard to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
     paths:
       - 'viewer-dashboard/**'
   workflow_dispatch:
