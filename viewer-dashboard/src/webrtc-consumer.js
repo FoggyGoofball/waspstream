@@ -1,16 +1,18 @@
 /**
  * WebRTC Consumer module for the Viewer Dashboard.
  *
- * Logs diagnostics to RTDB /diagnostics/viewer for cross-platform debugging.
- * When stream_status is "live", initializes a browser RTCPeerConnection,
- * reads the SDP Offer from /signaling/offer, generates an SDP Answer,
- * and exchanges ICE candidates via the RTDB to establish a direct P2P tunnel.
+ * Simplified for reliability:
+ * - Listens to /state for "live" status
+ * - Reads SDP offer from /signaling/offer
+ * - Creates RTCPeerConnection, sets remote offer, creates answer
+ * - Writes answer to /signaling/answer
+ * - Exchanges ICE candidates via RTDB
+ * - Console-only diagnostics (no RTDB writes from viewer)
  */
-import { ref, onValue, off, set, push, child, get, serverTimestamp } from 'firebase/database';
+import { ref, onValue, set, push, get } from 'firebase/database';
 import { getFirebaseDatabase } from './firebase-init.js';
 import { hideConnectionStatus } from './telemetry.js';
 
-// STUN servers (public Google STUN)
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -21,296 +23,185 @@ const ICE_SERVERS = {
 const liveVideo = document.getElementById('live-video');
 
 let peerConnection = null;
-let signalingOfferRef = null;
-let signalingAnswerRef = null;
-let signalingCandidatesRef = null;
-let offerUnsubscribe = null;
-let broadcastIceUnsubscribe = null;
-let stateUnsubscribe = null;
-let pendingCandidates = [];
-let offerProcessed = false;  // Guard against re-processing the same offer
-let lastStreamStatus = null; // Track previous stream status to avoid duplicate transitions
+let stateUnsub = null;
+let offerUnsub = null;
+let broadcasterIceUnsub = null;
+let lastStreamStatus = null;
+let offerProcessed = false;
 
-// ─── Diagnostics logging helper ───────────────────────────────────────────
-let diagnosticsRef = null;
-
-function viewerLog(step, message, data = {}) {
-  const db = getFirebaseDatabase();
-  if (!diagnosticsRef) {
-    diagnosticsRef = ref(db, 'diagnostics/viewer');
-  }
-  const entry = {
-    timestamp: new Date().toISOString(),
-    step,
-    message,
-    ...data,
-  };
-  console.log(`[ViewerDiag] ${step}: ${message}`, data);
-  // Write to RTDB (non-blocking, fire-and-forget)
-  set(ref(db, `diagnostics/viewer/${step}`), entry).catch((err) => {
-    console.warn('Failed to write viewer diagnostic:', err);
-  });
+function log(msg, data = {}) {
+  console.log(`[Viewer] ${msg}`, data);
 }
 
-function viewerLogError(step, errorMessage, data = {}) {
-  viewerLog(step, `ERROR: ${errorMessage}`, { ...data, level: 'error' });
+function logErr(msg, data = {}) {
+  console.error(`[Viewer] ERROR: ${msg}`, data);
 }
-// ───────────────────────────────────────────────────────────────────────────
 
 /**
  * Initialize the WebRTC consumer.
- * Listens to state changes and automatically connects/disconnects.
  */
 export function initWebRTC() {
-  const database = getFirebaseDatabase();
-  const stateRef = ref(database, 'state');
+  const db = getFirebaseDatabase();
+  log('WebRTC consumer initialized, listening to /state');
 
-  viewerLog('INIT_WEBRTC', 'WebRTC consumer initialized, listening to /state');
-
-  stateUnsubscribe = onValue(stateRef, async (snapshot) => {
-    const data = snapshot.val();
+  stateUnsub = onValue(ref(db, 'state'), async (snap) => {
+    const data = snap.val();
     const status = data ? data.stream_status : 'unknown';
-    // Guard: skip if status hasn't actually changed (onValue fires on every /state update including last_updated)
-    if (status === lastStreamStatus) {
-      return;
-    }
+
+    if (status === lastStreamStatus) return;
     lastStreamStatus = status;
-    viewerLog('STATE_CHANGE', `Stream status changed to: ${status}`);
-    if (data && data.stream_status === 'live') {
-      viewerLog('STATE_LIVE', 'Stream is live — connecting to broadcaster');
-      await connectToBroadcaster(database);
-    } else if (data && data.stream_status === 'offline') {
-      viewerLog('STATE_OFFLINE', 'Stream is offline — disconnecting');
+    log(`Stream status -> ${status}`);
+
+    if (status === 'live') {
+      await connectToBroadcaster(db);
+    } else if (status === 'offline') {
       disconnectFromBroadcaster();
     }
   });
 }
 
 /**
- * Connect to the broadcaster by reading its SDP offer and creating an answer.
+ * Connect to broadcaster via WebRTC.
  */
-async function connectToBroadcaster(database) {
-  // Clean up any existing connection first
+async function connectToBroadcaster(db) {
   disconnectFromBroadcaster();
+  offerProcessed = false;
+  log('Connecting to broadcaster');
 
-  signalingOfferRef = ref(database, 'signaling/offer');
-  signalingAnswerRef = ref(database, 'signaling/answer');
-  signalingCandidatesRef = ref(database, 'signaling/candidates');
-
-  viewerLog('CONNECT_START', 'Connecting to broadcaster — reading offer');
+  const offerR = ref(db, 'signaling/offer');
+  const answerR = ref(db, 'signaling/answer');
 
   try {
-    // Read the offer from signaling
-    const offerSnapshot = await get(signalingOfferRef);
-    const offerData = offerSnapshot.val();
+    // First try a one-time read
+    const offerSnap = await get(offerR);
+    const offerData = offerSnap.val();
 
-    if (!offerData || !offerData.sdp) {
-      viewerLog('CONNECT_NO_OFFER', 'No SDP offer available yet — waiting for persistent listener');
-      // Persistent listener for when offer becomes available.
-      // CRITICAL: Do NOT use { onlyOnce: true } — onValue with onlyOnce fires
-      // immediately with current (null) data and unsubscribes before the offer arrives.
-      // Use a persistent onValue with an offerProcessed guard flag instead.
-      if (offerUnsubscribe) {
-        offerUnsubscribe(); // remove previous listener if any
-      }
-      offerUnsubscribe = onValue(signalingOfferRef, async (snap) => {
-        const data = snap.val();
-        if (data && data.sdp && !offerProcessed) {
-          offerProcessed = true;
-          viewerLog('CONNECT_OFFER_LATE', 'SDP offer arrived via persistent listener');
-          await createAnswerAndConnect(data);
-        }
-      });
+    if (offerData && offerData.sdp) {
+      log('Offer found via get()');
+      await createAnswerAndConnect(db, offerData, answerR);
       return;
     }
 
-    viewerLog('CONNECT_HAS_OFFER', `SDP offer found, type=${offerData.type}, length=${offerData.sdp.length}`);
-    await createAnswerAndConnect(offerData);
-  } catch (error) {
-    viewerLogError('CONNECT_FAIL', 'Error connecting to broadcaster', { error: error.message });
+    // No offer yet — subscribe persistently
+    log('No offer yet, subscribing...');
+    offerUnsub = onValue(offerR, async (snap) => {
+      const data = snap.val();
+      if (data && data.sdp && !offerProcessed) {
+        offerProcessed = true;
+        log('Offer arrived via onValue');
+        offerUnsub(); // unsubscribe immediately
+        offerUnsub = null;
+        await createAnswerAndConnect(db, data, answerR);
+      }
+    });
+  } catch (err) {
+    logErr('Connection failed', { error: err.message });
   }
 }
 
 /**
- * Create a peer connection, set the remote offer, create and send an answer.
+ * Create answer and exchange ICE candidates.
  */
-async function createAnswerAndConnect(offerData) {
-  viewerLog('ANSWER_START', 'Creating RTCPeerConnection and answering');
+async function createAnswerAndConnect(db, offerData, answerR) {
   try {
-    // Create RTCPeerConnection
     peerConnection = new RTCPeerConnection(ICE_SERVERS);
-    viewerLog('ANSWER_PC', 'RTCPeerConnection created');
+    log('RTCPeerConnection created');
 
-    // Handle ICE candidates from the broadcaster
+    // ICE candidate -> RTDB
     peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
-        viewerLog('ANSWER_ICE_SEND', 'Viewer generated ICE candidate',
-          { sdpMLineIndex: event.candidate.sdpMLineIndex, sdpMid: event.candidate.sdpMid });
-        sendViewerIceCandidate(event.candidate);
-      }
-    };
-
-    peerConnection.onconnectionstatechange = () => {
-      viewerLog('CONNECTION_STATE', `Connection state: ${peerConnection.connectionState}`);
-      if (peerConnection.connectionState === 'connected') {
-        viewerLog('P2P_CONNECTED', 'WebRTC P2P connection established! 🎉');
-        hideConnectionStatus();
-      } else if (peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'disconnected') {
-        viewerLogError('CONNECTION_LOST', `Connection lost: ${peerConnection.connectionState}`);
-      }
-    };
-
-    peerConnection.ontrack = (event) => {
-      viewerLog('ON_TRACK', `Received ${event.track.kind} track`, { streams: event.streams.length });
-      if (event.track.kind === 'video') {
-        liveVideo.srcObject = event.streams[0];
-        viewerLog('VIDEO_ATTACHED', 'Video track attached to <video> element');
+        push(ref(db, 'signaling/candidates/viewer'), {
+          candidate: event.candidate.candidate,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          sdpMid: event.candidate.sdpMid,
+        }).catch(() => {});
       }
     };
 
     peerConnection.oniceconnectionstatechange = () => {
-      viewerLog('ICE_STATE', `ICE connection state: ${peerConnection.iceConnectionState}`);
+      log(`ICE: ${peerConnection.iceConnectionState}`);
     };
 
-    // Set remote description (the broadcaster's offer)
-    viewerLog('ANSWER_SET_REMOTE', 'Setting remote description from broadcaster offer',
-      { type: offerData.type, sdpLength: offerData.sdp.length });
-    const remoteOffer = new RTCSessionDescription({
-      type: offerData.type,
-      sdp: offerData.sdp,
-    });
-    await peerConnection.setRemoteDescription(remoteOffer);
-    viewerLog('ANSWER_REMOTE_OK', 'Remote description set successfully');
-
-    // Create answer
-    viewerLog('ANSWER_CREATE', 'Creating SDP answer');
-    const answer = await peerConnection.createAnswer();
-    viewerLog('ANSWER_CREATED', `SDP answer created, type=${answer.type}, length=${answer.sdp.length}`);
-
-    await peerConnection.setLocalDescription(answer);
-    viewerLog('ANSWER_LOCAL_OK', 'Local description set successfully');
-
-    // Send the answer to RTDB
-    await set(signalingAnswerRef, {
-      type: answer.type,
-      sdp: answer.sdp,
-    });
-    viewerLog('ANSWER_SENT', 'Answer written to RTDB /signaling/answer');
-
-    // Listen for ICE candidates from the broadcaster
-    viewerLog('ANSWER_ICE_LISTEN', 'Starting listener for broadcaster ICE candidates');
-    listenForBroadcasterIceCandidates();
-
-    // Process any pending candidates
-    const pending = pendingCandidates.length;
-    if (pending > 0) {
-      viewerLog('ANSWER_PENDING_ICE', `Processing ${pending} pending ICE candidates`);
-      while (pendingCandidates.length > 0) {
-        const candidate = pendingCandidates.shift();
-        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    peerConnection.onconnectionstatechange = () => {
+      log(`Connection: ${peerConnection.connectionState}`);
+      if (peerConnection.connectionState === 'connected') {
+        hideConnectionStatus();
       }
-    }
+    };
 
-    viewerLog('ANSWER_COMPLETE', 'WebRTC answer complete, waiting for P2P connection');
-  } catch (error) {
-    viewerLogError('ANSWER_FAIL', 'Error in WebRTC negotiation', { error: error.message, stack: error.stack });
+    peerConnection.ontrack = (event) => {
+      log(`Track: ${event.track.kind}`);
+      if (event.track.kind === 'video' && event.streams[0]) {
+        liveVideo.srcObject = event.streams[0];
+        liveVideo.classList.remove('hidden');
+        log('Video attached');
+      }
+    };
+
+    // Set remote offer
+    await peerConnection.setRemoteDescription(
+      new RTCSessionDescription({ type: offerData.type, sdp: offerData.sdp })
+    );
+    log('Remote description set');
+
+    // Create + set local answer
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+    log('Answer created');
+
+    // Send answer to RTDB
+    await set(answerR, { type: answer.type, sdp: answer.sdp });
+    log('Answer sent');
+
+    // Listen for broadcaster ICE candidates
+    listenForBroadcasterIceCandidates(db);
+
+  } catch (err) {
+    logErr('Answer failed', { error: err.message });
     cleanup();
   }
 }
 
 /**
- * Listen for ICE candidates coming from the broadcaster via RTDB.
+ * Listen for ICE candidates from the broadcaster.
  */
-function listenForBroadcasterIceCandidates() {
-  const database = getFirebaseDatabase();
-  const broadcasterCandidatesRef = ref(database, 'signaling/candidates/broadcaster');
+function listenForBroadcasterIceCandidates(db) {
+  broadcasterIceUnsub = onValue(
+    ref(db, 'signaling/candidates/broadcaster'),
+    (snap) => {
+      const data = snap.val();
+      if (!data || !peerConnection) return;
 
-  broadcastIceUnsubscribe = onValue(broadcasterCandidatesRef, (snapshot) => {
-    const data = snapshot.val();
-    if (!data || !peerConnection) return;
-
-    Object.values(data).forEach((candidateData) => {
-      if (candidateData && candidateData.candidate) {
-        const candidate = new RTCIceCandidate({
-          candidate: candidateData.candidate,
-          sdpMLineIndex: candidateData.sdpMLineIndex || 0,
-          sdpMid: candidateData.sdpMid || 'video',
-        });
-
-        if (peerConnection.remoteDescription) {
-          peerConnection.addIceCandidate(candidate).catch((err) => {
-            console.warn('Error adding ICE candidate:', err);
-          });
-        } else {
-          // Queue candidate if remote description not yet set
-          pendingCandidates.push(candidate);
+      Object.values(data).forEach((c) => {
+        if (c && c.candidate) {
+          peerConnection.addIceCandidate(
+            new RTCIceCandidate({
+              candidate: c.candidate,
+              sdpMLineIndex: c.sdpMLineIndex || 0,
+              sdpMid: c.sdpMid || 'video',
+            })
+          ).catch((err) => logErr('Add ICE candidate failed', { error: err.message }));
         }
-      }
-    });
-  });
+      });
+    }
+  );
 }
 
-/**
- * Send the viewer's ICE candidate to RTDB for the broadcaster to consume.
- */
-async function sendViewerIceCandidate(candidate) {
-  try {
-    const database = getFirebaseDatabase();
-    const viewerCandidateRef = child(
-      ref(database, 'signaling/candidates'),
-      'viewer'
-    );
-    await push(viewerCandidateRef, {
-      candidate: candidate.candidate,
-      sdpMLineIndex: candidate.sdpMLineIndex,
-      sdpMid: candidate.sdpMid,
-    });
-  } catch (error) {
-    console.error('Error sending ICE candidate:', error);
-  }
-}
-
-/**
- * Disconnect from the broadcaster and clean up all resources.
- */
 function disconnectFromBroadcaster() {
   cleanup();
-  offerProcessed = false;
-
-  // Reset video element
   liveVideo.src = '';
   liveVideo.classList.add('hidden');
+  log('Disconnected');
 }
 
-/**
- * Clean up WebRTC peer connection and RTDB listeners.
- */
 function cleanup() {
-  if (peerConnection) {
-    peerConnection.close();
-    peerConnection = null;
-  }
-
-  if (offerUnsubscribe) {
-    offerUnsubscribe();
-    offerUnsubscribe = null;
-  }
-
-  if (broadcastIceUnsubscribe) {
-    broadcastIceUnsubscribe();
-    broadcastIceUnsubscribe = null;
-  }
-
-  pendingCandidates = [];
+  if (peerConnection) { peerConnection.close(); peerConnection = null; }
+  if (offerUnsub) { offerUnsub(); offerUnsub = null; }
+  if (broadcasterIceUnsub) { broadcasterIceUnsub(); broadcasterIceUnsub = null; }
 }
 
-/**
- * Stop the WebRTC consumer and clean up all state.
- */
 export function stopWebRTC() {
-  if (stateUnsubscribe) {
-    stateUnsubscribe();
-    stateUnsubscribe = null;
-  }
+  log('Stopping WebRTC consumer');
+  if (stateUnsub) { stateUnsub(); stateUnsub = null; }
   cleanup();
 }

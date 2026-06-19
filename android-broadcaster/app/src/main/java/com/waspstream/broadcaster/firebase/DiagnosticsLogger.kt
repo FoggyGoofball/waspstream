@@ -1,75 +1,100 @@
 package com.waspstream.broadcaster.firebase
 
-import android.util.Log
-import com.google.firebase.database.ServerValue
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import com.google.firebase.database.FirebaseDatabase
+import kotlinx.coroutines.*
+import kotlinx.coroutines.tasks.await
 
 /**
- * Logs WebRTC handshake diagnostics to Firebase RTDB under /diagnostics/android.
- * Each entry includes a timestamp and a step description.
+ * In-memory buffered diagnostic logger.
  *
- * This allows the viewer dashboard to read live diagnostic data
- * alongside the video, making it easy to trace where the handshake fails.
+ * Rather than writing each log line individually to RTDB (which caused
+ * excessive writes), entries are stored in an in-memory buffer and
+ * flushed as a batch periodically or on demand.
  *
- * All methods are fire-and-forget (non-suspending), launching their own
- * coroutines internally so they can be called from any context including
- * WebRTC callbacks and SdpObserver implementations.
+ * Call [flush] to write out the current buffer to RTDB.
  */
 object DiagnosticsLogger {
 
-    private const val TAG = "DiagLogger"
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private const val MAX_ENTRIES = 200
+    private val buffer = mutableListOf<Map<String, Any>>()
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     /**
-     * Log a diagnostic event to RTDB /diagnostics/android/{step}.
-     * Also writes to Android logcat for local debugging.
-     *
-     * Non-suspending — safe to call from any thread or callback.
+     * Log a diagnostic entry. Buffered in-memory until [flush] is called.
      */
-    fun log(step: String, message: String, data: Map<String, Any?> = emptyMap()) {
-        val entry = linkedMapOf<String, Any?>(
-            "timestamp" to ServerValue.TIMESTAMP,
+    fun log(step: String, message: String, data: Map<String, Any?>? = null) {
+        val entry = mutableMapOf<String, Any>(
+            "ts" to System.currentTimeMillis(),
             "step" to step,
-            "message" to message
-        ).also { it.putAll(data) }
-
-        scope.launch {
-            try {
-                val ref = FirebaseRepository.databaseRef
-                    .child("diagnostics")
-                    .child("android")
-                    .child(step.replace(" ", "_").replace("/", "_"))
-
-                ref.setValue(entry)
-                Log.i(TAG, "[$step] $message")
-            } catch (e: Exception) {
-                // Don't let logging failures break the app
-                Log.w(TAG, "Failed to write diagnostic log for step=$step", e)
+            "msg" to message,
+            "level" to "info"
+        )
+        data?.forEach { (k, v) ->
+            if (v != null) entry[k] = v
+        }
+        synchronized(buffer) {
+            buffer.add(entry)
+            if (buffer.size >= 50) {
+                // Auto-flush when buffer fills
+                scope.launch { flush() }
             }
         }
+        println("[DIAG] $step: $message")
+    }
+
+    fun logError(step: String, message: String, data: Map<String, Any?>? = null) {
+        val entry = mutableMapOf<String, Any>(
+            "ts" to System.currentTimeMillis(),
+            "step" to step,
+            "msg" to message,
+            "level" to "error"
+        )
+        data?.forEach { (k, v) ->
+            if (v != null) entry[k] = v
+        }
+        synchronized(buffer) {
+            buffer.add(entry)
+            if (buffer.size >= 50) {
+                scope.launch { flush() }
+            }
+        }
+        System.err.println("[DIAG] ERROR: $step: $message")
     }
 
     /**
-     * Log an error event (no exception thrown, just a descriptive error).
+     * Flush the buffer to RTDB as a batch under /diagnostics/android.
+     * Keeps only the last [MAX_ENTRIES] in the buffer after flush.
      */
-    fun logError(step: String, errorMessage: String, details: Map<String, Any?> = emptyMap()) {
-        log(step, "ERROR: $errorMessage", details + mapOf("level" to "error"))
-    }
+    suspend fun flush() {
+        val snapshot: List<Map<String, Any>>
+        synchronized(buffer) {
+            if (buffer.isEmpty()) return
+            snapshot = buffer.toList()
+            buffer.clear()
+        }
 
-    /**
-     * Clear all diagnostics under /diagnostics/android (called on setup).
-     */
-    fun clear() {
-        scope.launch {
-            try {
-                FirebaseRepository.databaseRef
-                    .child("diagnostics")
-                    .child("android")
-                    .removeValue()
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to clear diagnostics", e)
+        try {
+            val androidRef = FirebaseDatabase.getInstance().getReference("diagnostics/android")
+            // Append new entries alongside existing ones
+            val existing = (androidRef.get().await().value as? Map<*, *>)?.toMutableMap() ?: mutableMapOf()
+            @Suppress("UNCHECKED_CAST")
+            val logArray = (existing["log"] as? List<Map<String, Any>>)?.toMutableList() ?: mutableListOf()
+            logArray.addAll(snapshot)
+            // Keep only last MAX_ENTRIES
+            val trimmed = logArray.takeLast(MAX_ENTRIES)
+            androidRef.setValue(mapOf(
+                "log" to trimmed,
+                "count" to trimmed.size,
+                "flushed_at" to System.currentTimeMillis()
+            )).await()
+        } catch (_: Exception) {
+            // If flush fails, re-add entries to buffer
+            synchronized(buffer) {
+                buffer.addAll(snapshot)
+                if (buffer.size > MAX_ENTRIES * 2) {
+                    val excess = buffer.size - MAX_ENTRIES
+                    repeat(excess) { buffer.removeFirstOrNull() }
+                }
             }
         }
     }

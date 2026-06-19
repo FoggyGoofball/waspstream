@@ -1,29 +1,28 @@
 package com.waspstream.broadcaster.webrtc
 
 import android.content.Context
-import android.os.Handler
-import android.os.HandlerThread
 import android.util.Log
 import org.webrtc.*
-import java.util.*
-import com.waspstream.broadcaster.firebase.DiagnosticsLogger
+import com.waspstream.broadcaster.firebase.FirebaseRepository
+import kotlinx.coroutines.*
+import kotlinx.coroutines.tasks.await
 
 /**
- * Manages the WebRTC PeerConnection lifecycle on the Broadcaster side.
+ * Unified WebRTC manager that handles PeerConnection lifecycle AND signaling
+ * over Firebase RTDB in one clean class.
  *
- * The Broadcaster creates a PeerConnection, adds a VideoTrack from the camera,
- * creates an SDP Offer, and handles the signaling exchange with the Viewer.
+ * Flow:
+ *   initialize() → createPeerConnection() (creates offer, sends to RTDB,
+ *   waits for viewer answer, sets remote desc, listens for viewer ICE) → dispose()
  *
- * CRITICAL: EGL must be initialized from the main thread on Mediatek/Android 8.1.
- * Using a dedicated HandlerThread for SurfaceTextureHelper to avoid EGL thread
- * affinity issues that cause SIGABRT in WebRTC's native signaling_thread.
+ * EGL is initialized on the creating thread with an immediate dummy pbuffer
+ * surface to ensure makeCurrent() never fails.
  */
 class WebRTCManager(
     private val context: Context,
-    private val onIceCandidate: (IceCandidate) -> Unit,
-    private val onConnectionStateChanged: (PeerConnection.PeerConnectionState) -> Unit
+    private val onDiagnostic: (step: String, message: String, data: Map<String, Any?>?) -> Unit,
+    private val onConnectionState: (PeerConnection.PeerConnectionState) -> Unit
 ) {
-
     companion object {
         private const val TAG = "WebRTCManager"
         private val STUN_SERVERS = listOf(
@@ -37,232 +36,296 @@ class WebRTCManager(
     private var videoTrack: VideoTrack? = null
     private var audioTrack: AudioTrack? = null
     private var videoCapturer: CameraVideoCapturer? = null
-
-    // Dedicated thread for SurfaceTextureHelper to keep EGL isolated from coroutine threads
-    private var webRtcThread: HandlerThread? = null
-    private var webRtcHandler: Handler? = null
     private var eglBase: EglBase? = null
 
-    /** Expose EGL context for local preview SurfaceViewRenderer */
-    val eglContext: EglBase.Context?
-        get() = eglBase?.eglBaseContext
+    private var signalingJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    // ── Diagnostics shorthand ──────────────────────────────────────────
+    private fun diag(step: String, message: String, data: Map<String, Any?>? = null) {
+        Log.d(TAG, "[$step] $message")
+        onDiagnostic(step, message, data)
+    }
+
+    // ── Initialization ─────────────────────────────────────────────────
 
     /**
-     * Initialize the PeerConnectionFactory.
+     * Initialize the EGL context and PeerConnectionFactory.
      * Must be called once before any peer connection is created.
+     *
+     * Creates a dummy pbuffer surface immediately and makes it current
+     * so the EGL context is ready for SurfaceTextureHelper.
      */
     fun initialize() {
-        Log.d(TAG, "initialize() — creating HandlerThread for EGL")
-        webRtcThread = HandlerThread("WebRTC-EglThread").apply { start() }
-        webRtcHandler = Handler(webRtcThread!!.looper)
+        diag("WIZ_INIT", "Initializing EGL + PeerConnectionFactory")
 
-        // Create EGL base on the main thread (required for Mediatek)
-        eglBase = EglBase.create()
+        // Use the library's default pixel buffer config (includes EGL_PBUFFER_BIT
+        // so the internal dummy pbuffer surface creation succeeds).
+        // NO custom config array — let EglBase pick the right config for this device.
+        eglBase = EglBase.create(null, EglBase.CONFIG_PIXEL_BUFFER)
 
-        // Initialize WebRTC
+        // Immediately create a dummy surface and make it current so the EGL context
+        // is fully initialized on this thread. This prevents "No EGLSurface" errors
+        // when SurfaceTextureHelper later tries to share this context.
+        eglBase!!.createDummyPbufferSurface()
+        eglBase!!.makeCurrent()
+        diag("WIZ_EGL_OK", "EGL initialized with dummy pbuffer surface")
+
+        // Initialize WebRTC native library
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context)
                 .setFieldTrials("")
                 .createInitializationOptions()
         )
 
-        val options = PeerConnectionFactory.Options()
         peerConnectionFactory = PeerConnectionFactory.builder()
-            .setOptions(options)
             .createPeerConnectionFactory()
 
-        Log.d(TAG, "initialize() complete — PeerConnectionFactory created")
+        diag("WIZ_INIT_OK", "PeerConnectionFactory created")
     }
 
-    /**
-     * Create a new PeerConnection with the given video capturer.
-     * The video capturer should be started before calling this.
-     */
-    fun createPeerConnection(videoCapturer: CameraVideoCapturer, localPreview: SurfaceViewRenderer?) {
-        val factory = peerConnectionFactory ?: throw IllegalStateException("PeerConnectionFactory not initialized")
-        val egl = eglBase ?: throw IllegalStateException("EglBase not initialized")
-
-        Log.d(TAG, "createPeerConnection() — using dedicated HandlerThread for SurfaceTextureHelper")
-        DiagnosticsLogger.log("WEBRTC_PC", "Creating PeerConnection on dedicated EGL thread")
-
-        // Create video source and track
-        videoSource = factory.createVideoSource(videoCapturer.isScreencast)
-
-        // CRITICAL: Must make EGL context current on THIS thread before sharing with
-        // SurfaceTextureHelper. On Mediatek/Android 8.1, the EGL context cannot be shared
-        // across threads unless it has been made current at least once on the creating thread.
-        // Otherwise the first video frame triggers a SIGABRT in the native GPU pipeline.
-        egl.makeCurrent()
-        videoCapturer.initialize(
-            SurfaceTextureHelper.create("WebRTC-SurfaceTexture", egl.eglBaseContext),
-            context,
-            videoSource?.capturerObserver
-        )
-        // Lower resolution and framerate to reduce encoder + EGL pipeline pressure
-        // on low-end Mediatek SoCs (MT6739/MT6580 based devices).
-        videoCapturer.startCapture(640, 480, 15)
-
-        videoTrack = factory.createVideoTrack("broadcast_video", videoSource!!)
-        videoTrack?.setEnabled(true)
-
-        localPreview?.let { preview ->
-            videoTrack?.addSink(preview)
-        }
-
-        // Create audio source and track
-        val audioConstraints = MediaConstraints().apply {
-            mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
-            mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
-            mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "true"))
-            mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
-        }
-        val audioSource = factory.createAudioSource(audioConstraints)
-        audioTrack = factory.createAudioTrack("broadcast_audio", audioSource)
-        audioTrack?.setEnabled(true)
-
-        // Create peer connection
-        val rtcConfig = PeerConnection.RTCConfiguration(STUN_SERVERS).apply {
-            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            iceCandidatePoolSize = 0
-        }
-
-        DiagnosticsLogger.log("WEBRTC_PC_CFG", "PeerConnection.RTCConfiguration built, creating PC")
-
-        peerConnection = factory.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
-            override fun onIceCandidate(candidate: IceCandidate) {
-                Log.d(TAG, "onIceCandidate: $candidate")
-                DiagnosticsLogger.log("WEBRTC_ICE", "onIceCandidate generated",
-                    mapOf("sdp" to candidate.sdp, "sdpMLineIndex" to candidate.sdpMLineIndex))
-                onIceCandidate(candidate)
-            }
-
-            override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {
-                Log.d(TAG, "onIceCandidatesRemoved: ${candidates.size}")
-            }
-
-            override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                Log.d(TAG, "onIceConnectionChange: $state")
-            }
-
-            override fun onIceConnectionReceivingChange(receiving: Boolean) {
-                Log.d(TAG, "onIceConnectionReceivingChange: $receiving")
-            }
-
-            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-                Log.d(TAG, "onIceGatheringChange: $state")
-            }
-
-            override fun onSignalingChange(state: PeerConnection.SignalingState) {
-                Log.d(TAG, "onSignalingChange: $state")
-            }
-
-            override fun onAddStream(stream: MediaStream) {
-                Log.d(TAG, "onAddStream: ${stream.getId()}")
-            }
-
-            override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {
-                Log.d(TAG, "onAddTrack")
-            }
-
-            override fun onRemoveStream(stream: MediaStream) {
-                Log.d(TAG, "onRemoveStream: ${stream.getId()}")
-            }
-
-            override fun onDataChannel(channel: DataChannel) {
-                Log.d(TAG, "onDataChannel: ${channel.label()}")
-            }
-
-            override fun onRenegotiationNeeded() {
-                Log.d(TAG, "onRenegotiationNeeded")
-            }
-
-            override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
-                Log.d(TAG, "onConnectionChange: $state")
-                DiagnosticsLogger.log("WEBRTC_CONNECTION", "Connection state: $state")
-                onConnectionStateChanged(state)
-            }
-
-            override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                Log.d(TAG, "onStandardizedIceConnectionChange: $state")
-            }
-        })
-
-        // Add media tracks
-        val stream = factory.createLocalMediaStream("broadcast_stream")
-        videoTrack?.let { stream.addTrack(it) }
-        audioTrack?.let { stream.addTrack(it) }
-        peerConnection?.addStream(stream)
-
-        DiagnosticsLogger.log("WEBRTC_PC_OK", "PeerConnection created with video+audio tracks")
-    }
+    // ── Main entry point ───────────────────────────────────────────────
 
     /**
-     * Create an SDP Offer for the current PeerConnection.
+     * Full streaming setup:
+     * 1. Create camera capturer
+     * 2. Create PeerConnection with video+audio tracks
+     * 3. Create SDP offer → write to RTDB
+     * 4. Wait for viewer answer (polling, 30s timeout)
+     * 5. Set remote answer
+     * 6. Listen for viewer ICE candidates
      */
-    fun createOffer(onSuccess: (SessionDescription) -> Unit) {
-        val constraints = MediaConstraints().apply {
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+    fun startStreaming() {
+        val factory = peerConnectionFactory ?: run {
+            diag("WIZ_ERROR", "PeerConnectionFactory not initialized — call initialize() first")
+            return
+        }
+        val egl = eglBase ?: run {
+            diag("WIZ_ERROR", "EGL not initialized — call initialize() first")
+            return
         }
 
-        peerConnection?.createOffer(object : SdpObserver {
-            override fun onCreateSuccess(sessionDescription: SessionDescription) {
-                peerConnection?.setLocalDescription(object : SdpObserver {
-                    override fun onSetSuccess() {
-                        Log.d(TAG, "Local SDP set successfully")
-                        onSuccess(sessionDescription)
+        signalingJob = scope.launch {
+            try {
+                // ── Step 1: Create camera capturer ──
+                diag("WIZ_CAM", "Creating camera capturer")
+                val capturer = createCameraCapturer()
+                videoCapturer = capturer
+                diag("WIZ_CAM_OK", "Camera capturer created: ${capturer.javaClass.simpleName}")
+
+                // ── Step 2: Create video source + track ──
+                videoSource = factory.createVideoSource(capturer.isScreencast)
+                capturer.initialize(
+                    SurfaceTextureHelper.create("WebRTC-STH", egl.eglBaseContext),
+                    context,
+                    videoSource!!.capturerObserver
+                )
+                capturer.startCapture(640, 480, 15)
+
+                videoTrack = factory.createVideoTrack("video", videoSource!!)
+                videoTrack!!.setEnabled(true)
+
+                // ── Step 3: Create audio source + track ──
+                val audioConstraints = MediaConstraints().apply {
+                    mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
+                    mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
+                }
+                val audioSource = factory.createAudioSource(audioConstraints)
+                audioTrack = factory.createAudioTrack("audio", audioSource)
+                audioTrack!!.setEnabled(true)
+
+                diag("WIZ_TRACKS", "Video + audio tracks created")
+
+                // ── Step 4: Create PeerConnection ──
+                val rtcConfig = PeerConnection.RTCConfiguration(STUN_SERVERS).apply {
+                    sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                    continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                }
+
+                peerConnection = factory.createPeerConnection(rtcConfig, createObserver())
+                if (peerConnection == null) {
+                    diag("WIZ_PC_FAIL", "createPeerConnection returned null")
+                    return@launch
+                }
+
+                // Add tracks via local media stream
+                val stream = factory.createLocalMediaStream("stream")
+                videoTrack?.let { stream.addTrack(it) }
+                audioTrack?.let { stream.addTrack(it) }
+                peerConnection!!.addStream(stream)
+
+                diag("WIZ_PC_OK", "PeerConnection created with tracks")
+
+                // ── Step 5: Create and send SDP offer ──
+                val offerDeferred = CompletableDeferred<SessionDescription>()
+                val constraints = MediaConstraints().apply {
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+                }
+                peerConnection!!.createOffer(object : SdpObserver {
+                    override fun onCreateSuccess(sdp: SessionDescription) {
+                        peerConnection!!.setLocalDescription(object : SdpObserver {
+                            override fun onSetSuccess() { offerDeferred.complete(sdp) }
+                            override fun onSetFailure(e: String) { offerDeferred.completeExceptionally(RuntimeException("setLocalDescription failed: $e")) }
+                            override fun onCreateSuccess(sdp: SessionDescription?) {}
+                            override fun onCreateFailure(e: String) {}
+                        }, sdp)
                     }
-                    override fun onSetFailure(error: String) {
-                        Log.e(TAG, "Failed to set local SDP: $error")
+                    override fun onCreateFailure(e: String) { offerDeferred.completeExceptionally(RuntimeException("createOffer failed: $e")) }
+                    override fun onSetSuccess() {}
+                    override fun onSetFailure(e: String) {}
+                }, constraints)
+                val offerResult = offerDeferred.await()
+
+                diag("WIZ_OFFER", "SDP offer created, writing to RTDB",
+                    mapOf("type" to offerResult.type.canonicalForm(), "sdpLen" to offerResult.description.length))
+
+                // Write offer to RTDB
+                FirebaseRepository.writeOffer(mapOf(
+                    "type" to offerResult.type.canonicalForm(),
+                    "sdp" to offerResult.description
+                ))
+                diag("WIZ_OFFER_SENT", "Offer written to /signaling/offer")
+
+                // ── Step 6: Wait for viewer answer ──
+                diag("WIZ_WAIT_ANSWER", "Polling for viewer answer (30s timeout)")
+                val answer = waitForAnswer(30_000)
+                if (answer == null) {
+                    diag("WIZ_TIMEOUT", "No answer from viewer within 30s")
+                    return@launch
+                }
+
+                diag("WIZ_ANSWER_OK", "Answer received, setting remote description")
+                val answerDesc = SessionDescription(
+                    SessionDescription.Type.fromCanonicalForm(answer["type"] ?: "answer"),
+                    answer["sdp"] ?: ""
+                )
+                peerConnection!!.setRemoteDescription(object : SdpObserver {
+                    override fun onSetSuccess() { diag("WIZ_REMOTE_SET", "Remote description set successfully") }
+                    override fun onSetFailure(e: String) { diag("WIZ_REMOTE_FAIL", "setRemoteDescription failed: $e") }
+                    override fun onCreateSuccess(sdp: SessionDescription?) {}
+                    override fun onCreateFailure(e: String) {}
+                }, answerDesc)
+
+                // ── Step 7: Listen for viewer ICE candidates ──
+                diag("WIZ_ICE_LISTEN", "Listening for viewer ICE candidates")
+                FirebaseRepository.onViewerIceCandidate { candidate ->
+                    if (candidate != null && peerConnection != null) {
+                        val iceCandidate = IceCandidate(
+                            candidate["sdpMid"] as? String ?: "video",
+                            (candidate["sdpMLineIndex"] as? Number)?.toInt() ?: 0,
+                            candidate["candidate"] as? String ?: ""
+                        )
+                        peerConnection!!.addIceCandidate(iceCandidate)
                     }
-                    override fun onCreateSuccess(sessionDescription: SessionDescription?) {}
-                    override fun onCreateFailure(error: String) {}
-                }, sessionDescription)
-            }
+                }
 
-            override fun onCreateFailure(error: String) {
-                Log.e(TAG, "Failed to create offer: $error")
+                diag("WIZ_DONE", "Streaming setup complete — viewer should now connect")
+            } catch (e: Exception) {
+                diag("WIZ_FAIL", "Streaming setup failed", mapOf("error" to (e.message ?: "")))
+                Log.e(TAG, "startStreaming failed", e)
             }
-            override fun onSetSuccess() {}
-            override fun onSetFailure(error: String) {}
-        }, constraints)
+        }
     }
 
-    /**
-     * Set the remote SDP Answer received from the viewer.
-     */
-    fun setRemoteAnswer(answer: SessionDescription) {
-        peerConnection?.setRemoteDescription(object : SdpObserver {
-            override fun onSetSuccess() {
-                Log.d(TAG, "Remote SDP set successfully")
+    // ── Signaling helpers ───────────────────────────────────────────────
+
+    private suspend fun waitForAnswer(timeoutMs: Long): Map<String, String>? {
+        val startTime = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startTime < timeoutMs) {
+            val snapshot = FirebaseRepository.signalingRef.child("answer").get().await()
+            @Suppress("UNCHECKED_CAST")
+            val answer = snapshot.value as? Map<String, String>
+            if (answer != null && answer["type"] == "answer") {
+                return answer
             }
-            override fun onSetFailure(error: String) {
-                Log.e(TAG, "Failed to set remote SDP: $error")
-            }
-            override fun onCreateSuccess(sessionDescription: SessionDescription?) {}
-            override fun onCreateFailure(error: String) {}
-        }, answer)
+            delay(500)
+        }
+        return null
     }
 
-    /**
-     * Add an ICE candidate received from the viewer.
-     */
-    fun addIceCandidate(candidate: IceCandidate) {
-        peerConnection?.addIceCandidate(candidate)
+    // ── ICE candidate sender ────────────────────────────────────────────
+
+    private fun sendIceCandidate(candidate: IceCandidate) {
+        scope.launch {
+            try {
+                FirebaseRepository.pushBroadcasterIceCandidate(mapOf(
+                    "candidate" to candidate.sdp,
+                    "sdpMLineIndex" to candidate.sdpMLineIndex,
+                    "sdpMid" to candidate.sdpMid
+                ))
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to send ICE candidate", e)
+            }
+        }
     }
 
-    /**
-     * Dispose the peer connection and release all resources.
-     */
+    // ── PeerConnection Observer ─────────────────────────────────────────
+
+    private fun createObserver() = object : PeerConnection.Observer {
+        override fun onIceCandidate(candidate: IceCandidate) {
+            diag("WIZ_ICE", "Sending ICE candidate", mapOf("sdpMLineIndex" to candidate.sdpMLineIndex))
+            sendIceCandidate(candidate)
+        }
+        override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) {}
+        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
+            diag("WIZ_ICE_CONN", "ICE connection: $state")
+        }
+        override fun onIceConnectionReceivingChange(receiving: Boolean) {}
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+            diag("WIZ_ICE_GATH", "ICE gathering: $state")
+        }
+        override fun onSignalingChange(state: PeerConnection.SignalingState) {
+            diag("WIZ_SIG", "Signaling: $state")
+        }
+        override fun onAddStream(stream: MediaStream) {}
+        override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {}
+        override fun onRemoveStream(stream: MediaStream) {}
+        override fun onDataChannel(channel: DataChannel) {}
+        override fun onRenegotiationNeeded() {}
+        override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
+            diag("WIZ_CONN", "Connection: $state")
+            onConnectionState(state)
+        }
+        override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState) {}
+    }
+
+    // ── Camera capturer creation ────────────────────────────────────────
+
+    private fun createCameraCapturer(): CameraVideoCapturer {
+        // Try Camera1 first (better compat on Android 8.1 / Mediatek)
+        try {
+            val e = org.webrtc.Camera1Enumerator(false)
+            val names = e.deviceNames
+            if (names.isNotEmpty()) {
+                val name = names.find { e.isBackFacing(it) } ?: names.first()
+                diag("WIZ_CAM1", "Using Camera1", mapOf("device" to name))
+                return e.createCapturer(name, null)
+            }
+        } catch (ex: Exception) {
+            Log.w(TAG, "Camera1 failed, trying Camera2", ex)
+        }
+
+        // Fallback to Camera2
+        val e = org.webrtc.Camera2Enumerator(context)
+        val names = e.deviceNames
+        val name = names.find { e.isBackFacing(it) } ?: names.firstOrNull()
+            ?: throw RuntimeException("No camera found")
+        diag("WIZ_CAM2", "Using Camera2", mapOf("device" to name))
+        return e.createCapturer(name, null)
+    }
+
+    // ── Cleanup ─────────────────────────────────────────────────────────
+
     fun dispose() {
-        Log.d(TAG, "dispose() — cleaning up WebRTC resources")
+        diag("WIZ_DISPOSE", "Cleaning up WebRTC resources")
+        signalingJob?.cancel()
+        signalingJob = null
+
         try {
             videoCapturer?.stopCapture()
             videoCapturer?.dispose()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error disposing capturer", e)
-        }
+        } catch (_: Exception) {}
 
         peerConnection?.dispose()
         peerConnection = null
@@ -275,14 +338,8 @@ class WebRTCManager(
         eglBase?.release()
         eglBase = null
 
-        webRtcThread?.quitSafely()
-        webRtcThread = null
-        webRtcHandler = null
-
-        Log.d(TAG, "dispose() complete")
+        diag("WIZ_DISPOSED", "Cleanup complete")
     }
 
-    fun setVideoCapturer(capturer: CameraVideoCapturer) {
-        this.videoCapturer = capturer
-    }
+    fun getEglContext(): EglBase.Context? = eglBase?.eglBaseContext
 }

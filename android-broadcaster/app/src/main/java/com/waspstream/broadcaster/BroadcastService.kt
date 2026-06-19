@@ -17,6 +17,8 @@ import androidx.core.app.NotificationCompat
 class BroadcastService : Service() {
 
     companion object {
+        const val ACTION_START = "com.waspstream.broadcaster.START"
+        const val ACTION_STOP = "com.waspstream.broadcaster.STOP"
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "waspstream_broadcast"
         private const val TAG = "BroadcastService"
