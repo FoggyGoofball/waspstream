@@ -28,6 +28,7 @@ let offerUnsub = null;
 let broadcasterIceUnsub = null;
 let lastStreamStatus = null;
 let offerProcessed = false;
+let isConnecting = false; // prevent re-entrant connection attempts
 
 function log(msg, data = {}) {
   console.log(`[Viewer] ${msg}`, data);
@@ -64,6 +65,11 @@ export function initWebRTC() {
  * Connect to broadcaster via WebRTC.
  */
 async function connectToBroadcaster(db) {
+  if (isConnecting) {
+    log('Already connecting — skipping re-entrant call');
+    return;
+  }
+  isConnecting = true;
   disconnectFromBroadcaster();
   offerProcessed = false;
   log('Connecting to broadcaster');
@@ -79,6 +85,7 @@ async function connectToBroadcaster(db) {
     if (offerData && offerData.sdp) {
       log('Offer found via get()');
       await createAnswerAndConnect(db, offerData, answerR);
+      isConnecting = false;
       return;
     }
 
@@ -129,21 +136,23 @@ async function createAnswerAndConnect(db, offerData, answerR) {
       }
     };
 
+    let videoTrackAssigned = false;
+
     peerConnection.ontrack = (event) => {
       log(`Track: ${event.track.kind}`, { trackId: event.track.id });
-      if (event.track.kind === 'video') {
+      if (event.track.kind === 'video' && !videoTrackAssigned) {
+        videoTrackAssigned = true;
         const stream = event.streams?.[0] || new MediaStream([event.track]);
         liveVideo.srcObject = stream;
         liveVideo.classList.remove('hidden');
-        liveVideo.play().catch((err) => {
-          if (err.name === 'NotAllowedError') {
-            log('Autoplay blocked — muting as fallback');
-            liveVideo.muted = true;
-            liveVideo.play().catch((e2) => logErr('play() still failed after mute', { error: e2.message }));
-          } else {
-            logErr('play() failed', { error: err.message });
-          }
-        });
+        // Only call play() if not already playing — prevents
+        // "interrupted by a new load request" error.
+        if (liveVideo.paused) {
+          liveVideo.muted = true; // always muted to satisfy autoplay policy
+          liveVideo.play().catch((err) => {
+            logErr('play() failed despite mute', { error: err.message });
+          });
+        }
         log('Video attached');
       }
     };

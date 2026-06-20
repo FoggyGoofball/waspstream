@@ -35,6 +35,8 @@ class WebRTCManager(
     private var ansL: ChildEventListener? = null
     private var iceL: ChildEventListener? = null
     private var reqL: ChildEventListener? = null
+    @Volatile private var disposed = false
+    @Volatile private var reinitInProgress = false
     private var frameCount = 0L
 
     private fun d(s: String, m: String, x: Map<String,Any?>? = null) { Log.d(TAG, "[$s] $m"); diag(s,m,x) }
@@ -43,7 +45,7 @@ class WebRTCManager(
      * Call this from a background thread — EGL / camera operations are blocking.
      */
     fun start() {
-        // Let BroadcastService know we're starting
+        if (disposed) return
         d("INIT","Starting WebRTC on bg thread")
 
         try {
@@ -147,6 +149,7 @@ class WebRTCManager(
     }
 
     private suspend fun writeOffer(offer: SessionDescription) {
+        if (disposed) return
         try {
             FirebaseRepository.signalingRef.child("offer").setValue(
                 mapOf("type" to offer.type.canonicalForm(), "sdp" to offer.description)
@@ -157,6 +160,7 @@ class WebRTCManager(
     }
 
     private suspend fun waitAnswer() {
+        if (disposed) return
         val def = CompletableDeferred<SessionDescription>()
         ansL = object : ChildEventListener {
             override fun onChildAdded(s: DataSnapshot, p: String?) {
@@ -238,7 +242,9 @@ class WebRTCManager(
                 when(s) {
                     PeerConnection.IceConnectionState.CONNECTED,
                     PeerConnection.IceConnectionState.COMPLETED -> FirebaseRepository.updateState("connected")
-                    PeerConnection.IceConnectionState.DISCONNECTED -> FirebaseRepository.updateState("live")
+                    // Do NOT write back to "live" on DISCONNECTED — that creates a loop
+                    // where the viewer disconnects, state flips to "live", viewer reconnects,
+                    // play() gets interrupted, and the cycle repeats forever.
                     PeerConnection.IceConnectionState.FAILED -> FirebaseRepository.updateState("error")
                     else -> {}
                 }
@@ -262,21 +268,41 @@ class WebRTCManager(
      * PeerConnection and generate a fresh offer so the viewer can connect even
      * after the initial handshake window has expired.
      */
+    private fun detachReqListener() {
+        reqL?.let {
+            try { FirebaseRepository.signalingRef.child("request_offer").removeEventListener(it) } catch (_: Exception) {}
+        }
+        reqL = null
+    }
+
     private suspend fun listenForOfferRequests() {
+        detachReqListener()
         reqL = object : ChildEventListener {
             override fun onChildAdded(s: DataSnapshot, p: String?) {
+                if (disposed || reinitInProgress) return
                 d("REQ_OFFER", "Viewer requested fresh offer — re-initializing")
                 io.launch {
-                    // Prevent stale ICE callbacks from firing on the old PC
-                    pc?.close()
-                    pc?.dispose()
-                    pc = null
-                    // Clear old signaling for a fresh handshake
+                    if (reinitInProgress) return@launch
+                    reinitInProgress = true
                     try {
-                        FirebaseRepository.clearSignaling()
-                    } catch (_: Exception) {}
-                    // Re-create PeerConnection with the same tracks and generate a new offer
-                    recreatePeerConnectionAndOffer()
+                        // Detach listeners so stale callbacks don't fire on the old PC
+                        detachReqListener()
+                        ansL?.let { FirebaseRepository.signalingRef.removeEventListener(it) }
+                        iceL?.let { FirebaseRepository.signalingRef.child("candidates").child("viewer").removeEventListener(it) }
+                        // Clean up old PC safely
+                        val oldPc = pc
+                        pc = null
+                        oldPc?.close()
+                        oldPc?.dispose()
+                        // Clear old signaling for a fresh handshake
+                        try { FirebaseRepository.clearSignaling() } catch (_: Exception) {}
+                        // Re-create PeerConnection with the same tracks and generate a new offer
+                        recreatePeerConnectionAndOffer()
+                    } catch (e: Exception) {
+                        d("REINIT_ERR", "Re-init failed: ${e.message}")
+                    } finally {
+                        reinitInProgress = false
+                    }
                 }
             }
             override fun onChildChanged(s: DataSnapshot, p: String?) {}
@@ -288,24 +314,29 @@ class WebRTCManager(
     }
 
     private fun recreatePeerConnectionAndOffer() {
+        if (disposed) return
         d("REINIT", "Recreating PeerConnection and generating new offer")
         try {
             val cfg = PeerConnection.RTCConfiguration(STUN).apply {
                 sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             }
-            pc = factory!!.createPeerConnection(cfg, PCObs())
-            if (pc == null) { d("REINIT_FAIL", "createPeerConnection returned null"); return }
+            val newPc = factory!!.createPeerConnection(cfg, PCObs())
+            if (newPc == null) { d("REINIT_FAIL", "createPeerConnection returned null"); return }
+            pc = newPc
 
-            pc!!.addTransceiver(vt!!, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY))
-            pc!!.addTransceiver(at!!, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY))
+            newPc.addTransceiver(vt!!, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY))
+            newPc.addTransceiver(at!!, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY))
             d("REINIT_TRK", "Transceivers re-added")
 
+            // Re-attach the request_offer listener
+            io.launch { listenForOfferRequests() }
+
             val mc = MediaConstraints()
-            pc!!.createOffer(
+            newPc.createOffer(
                 object : SdpObserver {
                     override fun onCreateSuccess(sdp: SessionDescription) {
                         d("REOFFER_OK", "New offer created")
-                        pc!!.setLocalDescription(object : SdpObserver {
+                        newPc.setLocalDescription(object : SdpObserver {
                             override fun onSetSuccess() {
                                 d("RELOCAL", "Local desc set, writing new offer to RTDB")
                                 io.launch { writeOffer(sdp) }
@@ -323,17 +354,21 @@ class WebRTCManager(
     }
 
     fun dispose() {
+        if (disposed) return
+        disposed = true
         try {
-            reqL?.let { FirebaseRepository.signalingRef.removeEventListener(it) }
+            detachReqListener()
             ansL?.let { FirebaseRepository.signalingRef.removeEventListener(it) }
-            iceL?.let { FirebaseRepository.signalingRef.removeEventListener(it) }
+            iceL?.let { FirebaseRepository.signalingRef.child("candidates").child("viewer").removeEventListener(it) }
+            val oldPc = pc
+            pc = null
+            oldPc?.close()
+            oldPc?.dispose()
             capturer?.dispose()
-            pc?.close()
-            pc?.dispose()
             vs?.dispose()
             factory?.dispose()
             egl?.release()
             d("DONE","Cleanup complete")
-        } catch(e: Exception) {}
+        } catch(e: Exception) { d("CLEAN_ERR", e.message?:"") }
     }
 }
