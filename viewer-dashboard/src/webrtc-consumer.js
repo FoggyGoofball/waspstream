@@ -130,10 +130,12 @@ async function createAnswerAndConnect(db, offerData, answerR) {
     };
 
     peerConnection.ontrack = (event) => {
-      log(`Track: ${event.track.kind}`);
-      if (event.track.kind === 'video' && event.streams[0]) {
-        liveVideo.srcObject = event.streams[0];
+      log(`Track: ${event.track.kind}`, { trackId: event.track.id });
+      if (event.track.kind === 'video') {
+        const stream = event.streams?.[0] || new MediaStream([event.track]);
+        liveVideo.srcObject = stream;
         liveVideo.classList.remove('hidden');
+        liveVideo.play().catch((err) => logErr('play() failed', { error: err.message }));
         log('Video attached');
       }
     };

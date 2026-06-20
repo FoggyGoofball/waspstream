@@ -133,11 +133,11 @@ function updateStateUI(data) {
       <span>Live</span>
     `;
 
-    // Show video, hide static image and overlay
-    staticImage.classList.add('hidden');
-    liveVideo.classList.remove('hidden');
-    offlineOverlay.classList.add('hidden');
-    connectionStatus.classList.remove('hidden');
+     // Show video, hide static image and overlay
+     staticImage.classList.add('hidden');
+     liveVideo.classList.remove('hidden');
+     offlineOverlay.classList.add('hidden');
+     // Don't touch connectionStatus here — WebRTC controls it
   } else {
     statusBadge.className = 'status-badge status-offline';
     statusText.textContent = 'Offline';

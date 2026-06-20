@@ -94,8 +94,38 @@ export function initDiagnosticsViewer() {
     ANDROID_LOG.scrollTop = ANDROID_LOG.scrollHeight;
   });
 
-  // Viewer diagnostics (console-only now)
-  VIEWER_LOG.innerHTML = '<div class="diag-entry diag-muted">Viewer diagnostics are logged to browser console (F12).</div>';
+  // Viewer diagnostics — show in-memory log
+  updateViewerLog();
+  setInterval(updateViewerLog, 1000);
+  
+  // Override console.log/error to capture viewer diagnostics
+  const viewerLogs = window.__viewerLogs = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  console.log = function(...args) {
+    viewerLogs.push({ ts: Date.now(), kind: 'log', text: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') });
+    origLog.apply(console, args);
+  };
+  console.error = function(...args) {
+    viewerLogs.push({ ts: Date.now(), kind: 'error', text: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') });
+    origErr.apply(console, args);
+  };
+
+  function updateViewerLog() {
+    const logs = window.__viewerLogs || [];
+    const recent = logs.slice(-20);
+    if (recent.length === 0) {
+      VIEWER_LOG.innerHTML = '<div class="diag-entry diag-muted">(waiting for viewer logs...)</div>';
+      return;
+    }
+    VIEWER_LOG.innerHTML = recent.map(e => {
+      const d = new Date(e.ts);
+      const t = d.toISOString().replace('T', ' ').substring(0, 19) + 'Z';
+      const cls = e.kind === 'error' ? 'diag-entry diag-error' : 'diag-entry';
+      return `<div class="${cls}">${t} ${escapeHtml(e.text)}</div>`;
+    }).join('\n');
+    VIEWER_LOG.scrollTop = VIEWER_LOG.scrollHeight;
+  }
 
   // Age updater
   if (ageInterval) clearInterval(ageInterval);
