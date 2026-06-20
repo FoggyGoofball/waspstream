@@ -34,6 +34,7 @@ class WebRTCManager(
     private val io = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var ansL: ChildEventListener? = null
     private var iceL: ChildEventListener? = null
+    private var reqL: ChildEventListener? = null
     private var frameCount = 0L
 
     private fun d(s: String, m: String, x: Map<String,Any?>? = null) { Log.d(TAG, "[$s] $m"); diag(s,m,x) }
@@ -101,6 +102,9 @@ class WebRTCManager(
             pc!!.addTransceiver(at!!, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY))
             d("TRK","Transceivers added send-only")
 
+            // Listen for viewer-initiated renegotiation requests
+            io.launch { listenForOfferRequests() }
+
             d("OFFER","Creating SDP offer")
             val mc = MediaConstraints()
             pc!!.createOffer(
@@ -163,7 +167,15 @@ class WebRTCManager(
                         if (t == "answer") SessionDescription.Type.ANSWER else SessionDescription.Type.OFFER, sd))
                 }
             }
-            override fun onChildChanged(s: DataSnapshot, p: String?) {}
+            override fun onChildChanged(s: DataSnapshot, p: String?) {
+                // Handles viewer updating an existing answer (e.g. page refresh)
+                if (s.key == "answer" && s.value != null) {
+                    val t = s.child("type").value?.toString() ?: return
+                    val sd = s.child("sdp").value?.toString() ?: return
+                    def.complete(SessionDescription(
+                        if (t == "answer") SessionDescription.Type.ANSWER else SessionDescription.Type.OFFER, sd))
+                }
+            }
             override fun onChildRemoved(s: DataSnapshot) {}
             override fun onChildMoved(s: DataSnapshot, p: String?) {}
             override fun onCancelled(e: DatabaseError) { def.completeExceptionally(Exception(e.message)) }
@@ -242,8 +254,77 @@ class WebRTCManager(
         override fun onTrack(r: RtpTransceiver) {}
     }
 
+    // ── Offer re-request listener ────────────────────────────────────────────
+
+    /**
+     * Listens on signaling/request_offer for viewer-initiated renegotiation.
+     * When a viewer writes a timestamp to this node, we tear down the current
+     * PeerConnection and generate a fresh offer so the viewer can connect even
+     * after the initial handshake window has expired.
+     */
+    private suspend fun listenForOfferRequests() {
+        reqL = object : ChildEventListener {
+            override fun onChildAdded(s: DataSnapshot, p: String?) {
+                d("REQ_OFFER", "Viewer requested fresh offer — re-initializing")
+                io.launch {
+                    // Prevent stale ICE callbacks from firing on the old PC
+                    pc?.close()
+                    pc?.dispose()
+                    pc = null
+                    // Clear old signaling for a fresh handshake
+                    try {
+                        FirebaseRepository.clearSignaling()
+                    } catch (_: Exception) {}
+                    // Re-create PeerConnection with the same tracks and generate a new offer
+                    recreatePeerConnectionAndOffer()
+                }
+            }
+            override fun onChildChanged(s: DataSnapshot, p: String?) {}
+            override fun onChildRemoved(s: DataSnapshot) {}
+            override fun onChildMoved(s: DataSnapshot, p: String?) {}
+            override fun onCancelled(e: DatabaseError) { d("REQ_OFFER_ERR", e.message ?: "") }
+        }
+        FirebaseRepository.signalingRef.child("request_offer").addChildEventListener(reqL!!)
+    }
+
+    private fun recreatePeerConnectionAndOffer() {
+        d("REINIT", "Recreating PeerConnection and generating new offer")
+        try {
+            val cfg = PeerConnection.RTCConfiguration(STUN).apply {
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            }
+            pc = factory!!.createPeerConnection(cfg, PCObs())
+            if (pc == null) { d("REINIT_FAIL", "createPeerConnection returned null"); return }
+
+            pc!!.addTransceiver(vt!!, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY))
+            pc!!.addTransceiver(at!!, RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY))
+            d("REINIT_TRK", "Transceivers re-added")
+
+            val mc = MediaConstraints()
+            pc!!.createOffer(
+                object : SdpObserver {
+                    override fun onCreateSuccess(sdp: SessionDescription) {
+                        d("REOFFER_OK", "New offer created")
+                        pc!!.setLocalDescription(object : SdpObserver {
+                            override fun onSetSuccess() {
+                                d("RELOCAL", "Local desc set, writing new offer to RTDB")
+                                io.launch { writeOffer(sdp) }
+                            }
+                            override fun onSetFailure(e: String) { d("REOFFER_FAIL", e) }
+                            override fun onCreateSuccess(s: SessionDescription?) {}
+                            override fun onCreateFailure(e: String) {}
+                        }, sdp)
+                    }
+                    override fun onCreateFailure(e: String) { d("REOFFER_FAIL", e) }
+                    override fun onSetSuccess() {}
+                    override fun onSetFailure(e: String) {}
+                }, mc)
+        } catch (e: Exception) { d("REINIT_ERR", "Re-init failed: ${e.message}") }
+    }
+
     fun dispose() {
         try {
+            reqL?.let { FirebaseRepository.signalingRef.removeEventListener(it) }
             ansL?.let { FirebaseRepository.signalingRef.removeEventListener(it) }
             iceL?.let { FirebaseRepository.signalingRef.removeEventListener(it) }
             capturer?.dispose()

@@ -9,7 +9,7 @@
  * - Exchanges ICE candidates via RTDB
  * - Console-only diagnostics (no RTDB writes from viewer)
  */
-import { ref, onValue, set, push, get } from 'firebase/database';
+import { ref, onValue, onChildAdded, set, push, get } from 'firebase/database';
 import { getFirebaseDatabase } from './firebase-init.js';
 import { hideConnectionStatus } from './telemetry.js';
 
@@ -135,7 +135,15 @@ async function createAnswerAndConnect(db, offerData, answerR) {
         const stream = event.streams?.[0] || new MediaStream([event.track]);
         liveVideo.srcObject = stream;
         liveVideo.classList.remove('hidden');
-        liveVideo.play().catch((err) => logErr('play() failed', { error: err.message }));
+        liveVideo.play().catch((err) => {
+          if (err.name === 'NotAllowedError') {
+            log('Autoplay blocked — muting as fallback');
+            liveVideo.muted = true;
+            liveVideo.play().catch((e2) => logErr('play() still failed after mute', { error: e2.message }));
+          } else {
+            logErr('play() failed', { error: err.message });
+          }
+        });
         log('Video attached');
       }
     };
@@ -166,27 +174,23 @@ async function createAnswerAndConnect(db, offerData, answerR) {
 
 /**
  * Listen for ICE candidates from the broadcaster.
+ * Uses onChildAdded so each candidate is processed exactly once,
+ * preventing InvalidStateError from re-injecting stale candidates.
  */
 function listenForBroadcasterIceCandidates(db) {
-  broadcasterIceUnsub = onValue(
-    ref(db, 'signaling/candidates/broadcaster'),
-    (snap) => {
-      const data = snap.val();
-      if (!data || !peerConnection) return;
+  const candidatesRef = ref(db, 'signaling/candidates/broadcaster');
+  broadcasterIceUnsub = onChildAdded(candidatesRef, (snap) => {
+    const c = snap.val();
+    if (!c || !c.candidate || !peerConnection) return;
 
-      Object.values(data).forEach((c) => {
-        if (c && c.candidate) {
-          peerConnection.addIceCandidate(
-            new RTCIceCandidate({
-              candidate: c.candidate,
-              sdpMLineIndex: c.sdpMLineIndex || 0,
-              sdpMid: c.sdpMid || 'video',
-            })
-          ).catch((err) => logErr('Add ICE candidate failed', { error: err.message }));
-        }
-      });
-    }
-  );
+    peerConnection.addIceCandidate(
+      new RTCIceCandidate({
+        candidate: c.candidate,
+        sdpMLineIndex: c.sdpMLineIndex || 0,
+        sdpMid: c.sdpMid || 'video',
+      })
+    ).catch((err) => logErr('Add ICE candidate failed', { error: err.message }));
+  });
 }
 
 function disconnectFromBroadcaster() {

@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -49,7 +50,11 @@ class BroadcastService : Service() {
         when (intent?.action) {
             ACTION_START -> {
                 Log.d(TAG, "ACTION_START received")
-                startForeground(NOTIFICATION_ID, buildNotification())
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                } else {
+                    startForeground(NOTIFICATION_ID, buildNotification())
+                }
                 acquireWakeLock()
                 startStreaming()
             }
@@ -63,7 +68,11 @@ class BroadcastService : Service() {
             }
             else -> {
                 // On cold start (null intent) just show notification
-                startForeground(NOTIFICATION_ID, buildNotification())
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                } else {
+                    startForeground(NOTIFICATION_ID, buildNotification())
+                }
             }
         }
         // Don't auto-restart after being stopped
